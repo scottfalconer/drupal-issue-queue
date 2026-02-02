@@ -1,6 +1,6 @@
 ---
 name: drupal-issue-queue
-description: Search Drupal.org issue queues and summarize individual issues via the Drupal.org api-d7 endpoints. Use for triage or filtering by status/priority/category/version/component/tag, summarizing issue threads, or extracting recent patches/files into JSON or Markdown while respecting Drupal.org API constraints (single-threaded, cached, rate-limited, read-only).
+description: Search Drupal.org issue queues and summarize individual issues via the Drupal.org api-d7 endpoints. Use for triage or debugging errors by checking for existing issues before patching, filtering by status/priority/category/version/component/tag, summarizing issue threads, or extracting recent patches/files into JSON or Markdown while respecting Drupal.org API constraints (single-threaded, cached, rate-limited, read-only).
 ---
 
 # Drupal Issue Queue

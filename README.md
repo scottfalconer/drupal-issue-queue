@@ -15,6 +15,7 @@ Configure your agent to invoke this skill when a user asks to:
 
 - Find the status of a specific issue.
 - Summarize recent comments on an issue.
+- Debug an error by checking whether a related issue already exists before patching locally.
 - List issues matching status, priority, category, version, or component.
 - Check whether a patch is attached to an issue.
 
@@ -116,6 +117,13 @@ The tool accepts human-readable aliases for common Drupal codes. See:
 - `references/issue-field-mappings.md`
 - `references/output-schema.md`
 - `references/drupalorg-api-d7.md`
+
+## Related skills
+
+This skill is designed to pair with:
+
+- `https://github.com/scottfalconer/drupal-contribute-fix`
+- `https://github.com/scottfalconer/drupal-intent-testing`
 
 ## Configuration defaults
 
