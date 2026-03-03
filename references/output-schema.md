@@ -62,6 +62,11 @@ This skill emits JSON for downstream agents and Markdown for human readers.
     "files": false,
     "tag_resolution": false,
     "request_budget_hit": false
+  },
+  "source": {
+    "backend": "api",
+    "tool": "api-d7",
+    "auto_fallback_reason": "optional when --backend=auto falls back"
   }
 }
 ```
@@ -100,6 +105,11 @@ This skill emits JSON for downstream agents and Markdown for human readers.
   "truncated": {
     "limit": true,
     "request_budget_hit": false
+  },
+  "source": {
+    "backend": "api",
+    "tool": "api-d7",
+    "auto_fallback_reason": "optional when --backend=auto falls back"
   }
 }
 ```

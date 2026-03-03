@@ -1,24 +1,35 @@
 ---
 name: drupal-issue-queue
-description: Search Drupal.org issue queues and summarize individual issues via the Drupal.org api-d7 endpoints. Use for triage or debugging errors by checking for existing issues before patching, filtering by status/priority/category/version/component/tag, summarizing issue threads, or extracting recent patches/files into JSON or Markdown while respecting Drupal.org API constraints (single-threaded, cached, rate-limited, read-only).
+description: >
+  Search Drupal.org issue queues and summarize individual issues for triage.
+  Uses a hybrid backend: prefer drupalorg-cli 0.8+ when available for
+  agent-aligned issue/project reads, and fall back to api-d7 for advanced
+  filtering and file/tag metadata while preserving read-only guardrails.
 ---
 
 # Drupal Issue Queue
 
 ## Guardrails
 
-- Use the Drupal.org API only; do not scrape HTML.
+- Keep all operations read-only.
+- Use official interfaces only: Drupal.org API and drupalorg-cli.
 - Keep requests single-threaded, cached, and rate-limited.
 - Respect request budgets and Retry-After headers.
 - Prefer small, scoped queries with explicit limits.
 
 ## Commands
 
+Global backend options:
+
+- `--backend auto|api|drupalorg` (default: `auto`)
+- `--drupalorg-bin <command-or-path>` (default: `drupalorg`; alias-friendly via login shell)
+
 ### Summarize an issue
 
 ```bash
-python scripts/dorg.py issue <nid-or-url> --format json
-python scripts/dorg.py issue <nid-or-url> --format md
+python scripts/dorg.py --format json issue <nid-or-url>
+python scripts/dorg.py --format md issue <nid-or-url>
+python scripts/dorg.py --backend drupalorg --format json issue <nid-or-url> --resolve-tags none --files-limit 0
 ```
 
 Common options:
@@ -31,10 +42,17 @@ Common options:
 - `--related-mrs` or `--extra-credit`
 - `--max-requests`, `--sleep-ms`, `--cache-ttl`, `--user-agent`
 
+When `--backend=drupalorg`, this command supports issue + comments only. Use:
+
+- `--resolve-tags none`
+- `--files-limit 0`
+- no `--related-mrs` / `--extra-credit`
+
 ### Search issues in a project
 
 ```bash
-python scripts/dorg.py search --project <machine_name> --format json
+python scripts/dorg.py --format json search --project <machine_name>
+python scripts/dorg.py --backend drupalorg --format json search --project <machine_name> --status rtbc
 ```
 
 Common filters:
@@ -47,10 +65,30 @@ Common filters:
 - `--tag-tid <tid>`
 - `--limit N --sort changed|created|nid --direction ASC|DESC`
 
+`drupalorg` backend search supports only:
+
+- status: `needs review` (`8`) or `rtbc` (`14`)
+- default sort/direction (`changed` + `DESC`)
+- no priority/category/version/component/tag filters
+
 ## Outputs
 
 - JSON output is structured for downstream agents; see `references/output-schema.md`.
 - Markdown output provides a human-readable summary and is suitable for briefings.
+- Output includes a `source` block with backend metadata and optional auto-fallback reason.
+
+## Contribution Handoff
+
+For fork/MR workflows introduced in drupalorg-cli 0.8+, hand off to these commands:
+
+```bash
+drupalorg issue:get-fork <nid> --format=llm
+drupalorg issue:setup-remote <nid>
+drupalorg issue:checkout <nid> <branch>
+drupalorg mr:list <nid> --format=llm
+drupalorg mr:status <nid> <mr-iid> --format=llm
+drupalorg mr:logs <nid> <mr-iid>
+```
 
 ## References
 

@@ -11,7 +11,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import shlex
 import socket
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -25,6 +28,7 @@ import urllib.request
 API_BASE = "https://www.drupal.org/api-d7"
 MAX_PAGE_LIMIT = 50
 TAG_RESOLVE_LIMIT = 10
+BASH_ALIAS_PREFIX = "shopt -s expand_aliases; if [ -f ~/.bashrc ]; then source ~/.bashrc >/dev/null 2>&1; fi; "
 
 ISSUE_STATUS = {
     1: "Active",
@@ -643,6 +647,11 @@ def issue_to_markdown(summary: Dict[str, Any]) -> str:
     lines.append(f"- Updated: {summary.get('updated')}")
     lines.append(f"- Comment count: {summary.get('comment_count')}")
     lines.append(f"- Last comment: {format_ts(summary.get('last_comment_ts'))}")
+    source = summary.get("source") or {}
+    if source.get("backend"):
+        lines.append(f"- Source backend: {source.get('backend')}")
+        if source.get("auto_fallback_reason"):
+            lines.append(f"- Backend fallback: {source.get('auto_fallback_reason')}")
     tags = summary.get("tags") or []
     if tags:
         tag_parts = []
@@ -700,6 +709,11 @@ def search_to_markdown(payload: Dict[str, Any]) -> str:
     query = payload.get("query", {})
     if query:
         lines.append(f"Query: {query}")
+    source = payload.get("source") or {}
+    if source.get("backend"):
+        lines.append(f"Source backend: {source.get('backend')}")
+        if source.get("auto_fallback_reason"):
+            lines.append(f"Backend fallback: {source.get('auto_fallback_reason')}")
     lines.append(f"Returned: {payload.get('count')} (limit {payload.get('limit')})")
     truncated = payload.get("truncated") or {}
     if any(truncated.values()):
@@ -731,7 +745,7 @@ def build_user_agent(user_agent: Optional[str]) -> str:
     return f"drupal-issue-queue/0.1 (contact: {user}@{host})"
 
 
-def command_issue(args: argparse.Namespace) -> Dict[str, Any]:
+def command_issue_api(args: argparse.Namespace) -> Dict[str, Any]:
     nid = parse_nid(args.nid_or_url)
     cache = Cache(Path(args.cache_dir), args.cache_ttl)
     budget = RequestBudget(args.max_requests)
@@ -806,7 +820,9 @@ def command_issue(args: argparse.Namespace) -> Dict[str, Any]:
         "request_budget_hit": budget.hit,
     }
 
-    return issue_to_summary(node, comments, files, tags, truncated_flags)
+    summary = issue_to_summary(node, comments, files, tags, truncated_flags)
+    summary["source"] = {"backend": "api", "tool": "api-d7"}
+    return summary
 
 
 def fetch_comments(
@@ -846,7 +862,7 @@ def fetch_comments(
     return results[:limit]
 
 
-def command_search(args: argparse.Namespace) -> Dict[str, Any]:
+def command_search_api(args: argparse.Namespace) -> Dict[str, Any]:
     cache = Cache(Path(args.cache_dir), args.cache_ttl)
     budget = RequestBudget(args.max_requests)
     limiter = RateLimiter(args.sleep_ms)
@@ -856,16 +872,7 @@ def command_search(args: argparse.Namespace) -> Dict[str, Any]:
     if project_nid is None:
         raise DrupalOrgError(f"Project not found: {args.project}")
 
-    status = parse_alias(args.status, STATUS_ALIASES)
-    priority = parse_alias(args.priority, PRIORITY_ALIASES)
-    category = parse_alias(args.category, CATEGORY_ALIASES)
-
-    if args.status and status is None:
-        raise DrupalOrgError(f"Unknown status alias: {args.status}")
-    if args.priority and priority is None:
-        raise DrupalOrgError(f"Unknown priority alias: {args.priority}")
-    if args.category and category is None:
-        raise DrupalOrgError(f"Unknown category alias: {args.category}")
+    status, priority, category = parse_search_filters(args)
 
     limit = max(1, args.limit)
     results: List[Dict[str, Any]] = []
@@ -929,6 +936,7 @@ def command_search(args: argparse.Namespace) -> Dict[str, Any]:
             "limit": len(formatted) >= limit,
             "request_budget_hit": budget.hit,
         },
+        "source": {"backend": "api", "tool": "api-d7"},
     }
     return payload
 
@@ -978,8 +986,350 @@ def parse_files_limit(value: str) -> Optional[int]:
     return parsed
 
 
+def parse_search_filters(args: argparse.Namespace) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    status = parse_alias(args.status, STATUS_ALIASES)
+    priority = parse_alias(args.priority, PRIORITY_ALIASES)
+    category = parse_alias(args.category, CATEGORY_ALIASES)
+
+    if args.status and status is None:
+        raise DrupalOrgError(f"Unknown status alias: {args.status}")
+    if args.priority and priority is None:
+        raise DrupalOrgError(f"Unknown priority alias: {args.priority}")
+    if args.category and category is None:
+        raise DrupalOrgError(f"Unknown category alias: {args.category}")
+    return status, priority, category
+
+
+def comments_limit_for_issue(args: argparse.Namespace) -> int:
+    comments_limit = args.comments
+    if comments_limit is None:
+        comments_limit = 10 if args.mode == "summary" else 50
+    return max(0, comments_limit)
+
+
+def resolve_drupalorg_bin(binary: str) -> Optional[str]:
+    if not binary:
+        return None
+    parts = shlex.split(binary)
+    if not parts:
+        return None
+
+    first = parts[0]
+    has_separator = os.path.sep in first or (os.path.altsep and os.path.altsep in first)
+    if has_separator and os.path.isfile(first) and os.access(first, os.X_OK):
+        return binary
+    if shutil.which(first):
+        return binary
+
+    probe = subprocess.run(
+        ["bash", "-lc", BASH_ALIAS_PREFIX + f"type {shlex.quote(first)}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        return binary
+    return None
+
+
+def run_drupalorg_json(drupalorg_bin: str, command: List[str]) -> Any:
+    base = shlex.split(drupalorg_bin)
+    if not base:
+        raise DrupalOrgError("drupalorg command is empty")
+    shell_cmd = " ".join(shlex.quote(part) for part in (base + command))
+    process = subprocess.run(
+        ["bash", "-lc", BASH_ALIAS_PREFIX + shell_cmd],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        stderr = process.stderr.strip()
+        stdout = process.stdout.strip()
+        detail = stderr or stdout or f"exit code {process.returncode}"
+        raise DrupalOrgError(f"drupalorg command failed ({' '.join(command)}): {detail}")
+
+    output = process.stdout.strip()
+    if not output:
+        raise DrupalOrgError(f"drupalorg command returned empty output ({' '.join(command)})")
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise DrupalOrgError(f"drupalorg returned invalid JSON ({' '.join(command)})") from exc
+
+
+def drupalorg_issue_compatibility_reasons(args: argparse.Namespace) -> List[str]:
+    reasons: List[str] = []
+    if args.resolve_tags != "none":
+        reasons.append("--resolve-tags must be 'none'")
+    if args.tag_map:
+        reasons.append("--tag-map is only supported with the api backend")
+    if args.files_limit != 0:
+        reasons.append("--files-limit must be 0")
+    if args.related_mrs:
+        reasons.append("--related-mrs is only supported with the api backend")
+    if args.extra_credit:
+        reasons.append("--extra-credit is only supported with the api backend")
+    return reasons
+
+
+def drupalorg_search_issue_type(status_code: Optional[int]) -> Optional[str]:
+    if status_code is None:
+        return "all"
+    if status_code == 14:
+        return "rtbc"
+    if status_code == 8:
+        return "review"
+    return None
+
+
+def drupalorg_search_compatibility_reasons(args: argparse.Namespace) -> List[str]:
+    status, priority, category = parse_search_filters(args)
+    reasons: List[str] = []
+    if priority is not None:
+        reasons.append("--priority is only supported with the api backend")
+    if category is not None:
+        reasons.append("--category is only supported with the api backend")
+    if args.version:
+        reasons.append("--version is only supported with the api backend")
+    if args.component:
+        reasons.append("--component is only supported with the api backend")
+    if args.tag_tid:
+        reasons.append("--tag-tid is only supported with the api backend")
+    if args.sort != "changed":
+        reasons.append("--sort must remain 'changed'")
+    if args.direction != "DESC":
+        reasons.append("--direction must remain 'DESC'")
+    if drupalorg_search_issue_type(status) is None:
+        reasons.append("--status only supports 'needs review' or 'rtbc' with drupalorg backend")
+    return reasons
+
+
+def choose_issue_backend(args: argparse.Namespace) -> Tuple[str, Optional[str], Optional[str]]:
+    if args.backend == "api":
+        return "api", None, None
+
+    drupalorg_bin = resolve_drupalorg_bin(args.drupalorg_bin)
+    reasons = drupalorg_issue_compatibility_reasons(args)
+
+    if args.backend == "drupalorg":
+        if drupalorg_bin is None:
+            raise DrupalOrgError(f"drupalorg backend requested but binary not found: {args.drupalorg_bin}")
+        if reasons:
+            raise DrupalOrgError("drupalorg backend incompatible with selected options: " + "; ".join(reasons))
+        return "drupalorg", drupalorg_bin, None
+
+    if drupalorg_bin and not reasons:
+        return "drupalorg", drupalorg_bin, None
+    if drupalorg_bin and reasons:
+        return "api", None, "; ".join(reasons)
+    return "api", None, "drupalorg binary not found"
+
+
+def choose_search_backend(args: argparse.Namespace) -> Tuple[str, Optional[str], Optional[str]]:
+    if args.backend == "api":
+        return "api", None, None
+
+    drupalorg_bin = resolve_drupalorg_bin(args.drupalorg_bin)
+    reasons = drupalorg_search_compatibility_reasons(args)
+
+    if args.backend == "drupalorg":
+        if drupalorg_bin is None:
+            raise DrupalOrgError(f"drupalorg backend requested but binary not found: {args.drupalorg_bin}")
+        if reasons:
+            raise DrupalOrgError("drupalorg backend incompatible with selected options: " + "; ".join(reasons))
+        return "drupalorg", drupalorg_bin, None
+
+    if drupalorg_bin and not reasons:
+        return "drupalorg", drupalorg_bin, None
+    if drupalorg_bin and reasons:
+        return "api", None, "; ".join(reasons)
+    return "api", None, "drupalorg binary not found"
+
+
+def drupalorg_comment_summary(comment: Dict[str, Any]) -> Dict[str, Any]:
+    created_ts = to_int(comment.get("created"))
+    body_html = comment.get("body_value")
+    return {
+        "cid": str(comment.get("cid")) if comment.get("cid") is not None else None,
+        "created_ts": created_ts,
+        "created": format_ts(created_ts),
+        "author_uid": comment.get("author_id"),
+        "author_name": comment.get("author_name"),
+        "body_markdown": html_to_markdown(body_html),
+    }
+
+
+def command_issue_drupalorg(args: argparse.Namespace, drupalorg_bin: str) -> Dict[str, Any]:
+    nid = parse_nid(args.nid_or_url)
+    comments_limit = comments_limit_for_issue(args)
+    command = ["issue:show", nid, "--format=json"]
+    if comments_limit > 0:
+        command.append("--with-comments")
+
+    payload = run_drupalorg_json(drupalorg_bin, command)
+    if not isinstance(payload, dict):
+        raise DrupalOrgError("Unexpected drupalorg issue response")
+
+    all_comments = [drupalorg_comment_summary(c) for c in ensure_list(payload.get("comments")) if isinstance(c, dict)]
+    all_comments.sort(key=lambda item: ((item.get("created_ts") or 0), to_int(item.get("cid")) or 0))
+    if args.comment_direction == "DESC":
+        all_comments.reverse()
+    selected_comments = all_comments[:comments_limit] if comments_limit > 0 else []
+
+    created_ts = to_int(payload.get("created"))
+    updated_ts = to_int(payload.get("changed"))
+    status_code = to_int(payload.get("field_issue_status"))
+    priority_code = to_int(payload.get("field_issue_priority"))
+    category_code = to_int(payload.get("field_issue_category"))
+    comment_count = len(all_comments) if comments_limit > 0 else 0
+    last_comment_ts = max((c.get("created_ts") or 0 for c in all_comments), default=0) or None
+
+    return {
+        "nid": str(payload.get("nid")) if payload.get("nid") is not None else nid,
+        "title": payload.get("title"),
+        "url": f"https://www.drupal.org/node/{nid}",
+        "created_ts": created_ts,
+        "created": format_ts(created_ts),
+        "updated_ts": updated_ts,
+        "updated": format_ts(updated_ts),
+        "status": build_status(status_code, ISSUE_STATUS),
+        "priority": build_status(priority_code, ISSUE_PRIORITY),
+        "category": build_status(category_code, ISSUE_CATEGORY),
+        "version": payload.get("field_issue_version"),
+        "component": payload.get("field_issue_component"),
+        "tags": [],
+        "related_mrs": [],
+        "comment_count": comment_count,
+        "last_comment_ts": last_comment_ts,
+        "body_markdown": html_to_markdown(payload.get("body_value")),
+        "latest_comments": selected_comments,
+        "files": [],
+        "truncated": {
+            "comments": len(selected_comments) < len(all_comments),
+            "files": False,
+            "tag_resolution": False,
+            "request_budget_hit": False,
+        },
+        "source": {"backend": "drupalorg", "tool": "drupalorg-cli", "command": "issue:show"},
+    }
+
+
+def command_search_drupalorg(args: argparse.Namespace, drupalorg_bin: str) -> Dict[str, Any]:
+    status, priority, category = parse_search_filters(args)
+    issue_type = drupalorg_search_issue_type(status)
+    if issue_type is None:
+        raise DrupalOrgError("drupalorg search backend only supports status 'needs review' or 'rtbc'")
+
+    command = [
+        "project:issues",
+        args.project,
+        issue_type,
+        "--limit",
+        str(max(1, args.limit)),
+        "--format=json",
+    ]
+    payload = run_drupalorg_json(drupalorg_bin, command)
+    if not isinstance(payload, dict):
+        raise DrupalOrgError("Unexpected drupalorg project:issues response")
+
+    results = []
+    for issue in ensure_list(payload.get("issues")):
+        if not isinstance(issue, dict):
+            continue
+        status_code = to_int(issue.get("field_issue_status"))
+        nid = str(issue.get("nid")) if issue.get("nid") is not None else None
+        results.append(
+            {
+                "nid": nid,
+                "title": issue.get("title"),
+                "url": f"https://www.drupal.org/node/{nid}" if nid else None,
+                "created_ts": None,
+                "created": None,
+                "updated_ts": None,
+                "updated": None,
+                "status": build_status(status_code, ISSUE_STATUS),
+                "priority": build_status(None, ISSUE_PRIORITY),
+                "category": build_status(None, ISSUE_CATEGORY),
+            }
+        )
+
+    return {
+        "project": {"machine_name": args.project, "nid": None},
+        "query": {
+            "status": status,
+            "priority": priority,
+            "category": category,
+            "version": args.version,
+            "component": args.component,
+            "tag_tid": args.tag_tid,
+            "sort": args.sort,
+            "direction": args.direction,
+        },
+        "count": len(results),
+        "limit": max(1, args.limit),
+        "results": results[: max(1, args.limit)],
+        "truncated": {
+            "limit": len(results) >= max(1, args.limit),
+            "request_budget_hit": False,
+        },
+        "source": {"backend": "drupalorg", "tool": "drupalorg-cli", "command": "project:issues"},
+    }
+
+
+def command_issue(args: argparse.Namespace) -> Dict[str, Any]:
+    backend, drupalorg_bin, fallback_reason = choose_issue_backend(args)
+    if backend == "drupalorg":
+        try:
+            return command_issue_drupalorg(args, drupalorg_bin or args.drupalorg_bin)
+        except DrupalOrgError:
+            if args.backend == "drupalorg":
+                raise
+            payload = command_issue_api(args)
+            payload.setdefault("source", {})
+            payload["source"]["auto_fallback_reason"] = "drupalorg execution failed; fell back to api backend"
+            return payload
+
+    payload = command_issue_api(args)
+    if fallback_reason:
+        payload.setdefault("source", {})
+        payload["source"]["auto_fallback_reason"] = fallback_reason
+    return payload
+
+
+def command_search(args: argparse.Namespace) -> Dict[str, Any]:
+    backend, drupalorg_bin, fallback_reason = choose_search_backend(args)
+    if backend == "drupalorg":
+        try:
+            return command_search_drupalorg(args, drupalorg_bin or args.drupalorg_bin)
+        except DrupalOrgError:
+            if args.backend == "drupalorg":
+                raise
+            payload = command_search_api(args)
+            payload.setdefault("source", {})
+            payload["source"]["auto_fallback_reason"] = "drupalorg execution failed; fell back to api backend"
+            return payload
+
+    payload = command_search_api(args)
+    if fallback_reason:
+        payload.setdefault("source", {})
+        payload["source"]["auto_fallback_reason"] = fallback_reason
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Drupal.org issue queue helper")
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "api", "drupalorg"],
+        default="auto",
+        help="Data source backend: auto (prefer drupalorg when compatible), api, or drupalorg",
+    )
+    parser.add_argument(
+        "--drupalorg-bin",
+        default="drupalorg",
+        help="drupalorg command or executable path (aliases supported via login shell)",
+    )
     parser.add_argument("--user-agent", help="Custom User-Agent string")
     parser.add_argument(
         "--cache-dir",
